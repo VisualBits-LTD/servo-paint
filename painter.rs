@@ -307,7 +307,11 @@ impl Painter {
                 enable_dithering: true,
                 clear_color,
                 upload_method,
-                max_internal_texture_size: low_memory_webrender.then_some(1024),
+                // WebRender rejects values below its compile-time
+                // MIN_TEXTURE_SIZE. Keep the minimum supported 2048 limit;
+                // the other low-memory settings still prevent eager atlas and
+                // transient-surface growth.
+                max_internal_texture_size: low_memory_webrender.then_some(2048),
                 upload_pbo_default_size: if low_memory_webrender {
                     128 * 128 * 4
                 } else {
