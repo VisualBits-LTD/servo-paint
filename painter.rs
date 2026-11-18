@@ -6,6 +6,7 @@ use std::cell::{Cell, LazyCell};
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use dpi::PhysicalSize;
@@ -75,6 +76,17 @@ fn low_memory_webrender_enabled() -> bool {
             "1" | "true" | "yes" | "on"
         )
     })
+}
+
+fn low_memory_reclaim_interval() -> Duration {
+    const DEFAULT_RECLAIM_INTERVAL_SECS: u64 = 60;
+
+    std::env::var("SERVO_WEBRENDER_RECLAIM_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_RECLAIM_INTERVAL_SECS))
 }
 
 fn low_memory_texture_cache_config() -> webrender::TextureCacheConfig {
@@ -160,6 +172,14 @@ pub(crate) struct Painter {
 
     /// A counter used to generate new property binding keys for [`WebView`]s.
     property_binding_key_counter: Cell<u64>,
+
+    /// Deadline for asking WebRender to release caches that are not required
+    /// by the current scene. Full browsers favor reuse, but a long-lived
+    /// overlay should not retain one-time navigation and upload allocations.
+    next_memory_reclaim: Option<Instant>,
+
+    /// Interval between low-memory cache reclamation passes.
+    memory_reclaim_interval: Duration,
 }
 
 impl Drop for Painter {
@@ -237,10 +257,18 @@ impl Painter {
         } else {
             UploadMethod::PixelBuffer(ONE_TIME_USAGE_HINT)
         };
-        let worker_threads = std::thread::available_parallelism()
-            .map(|i| i.get())
-            .unwrap_or(pref!(thread_pool_fallback_workers) as usize)
-            .min(pref!(thread_pool_webrender_workers_max).max(1) as usize);
+        let low_memory_webrender = low_memory_webrender_enabled();
+        let worker_threads = if low_memory_webrender {
+            // Overlay compositing is bounded by its configured output rate.
+            // A single worker avoids per-worker scratch arenas while retaining
+            // the same rendering feature surface.
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(|i| i.get())
+                .unwrap_or(pref!(thread_pool_fallback_workers) as usize)
+                .min(pref!(thread_pool_webrender_workers_max).max(1) as usize)
+        };
         let workers = Some(Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(worker_threads)
@@ -255,7 +283,7 @@ impl Painter {
                 .expect("Unable to initialize WebRender worker pool."),
         ));
 
-        let low_memory_webrender = low_memory_webrender_enabled();
+        let memory_reclaim_interval = low_memory_reclaim_interval();
         let painter_id = PainterId::next();
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
@@ -279,20 +307,20 @@ impl Painter {
                 enable_dithering: true,
                 clear_color,
                 upload_method,
-                max_internal_texture_size: low_memory_webrender.then_some(2048),
+                max_internal_texture_size: low_memory_webrender.then_some(1024),
                 upload_pbo_default_size: if low_memory_webrender {
-                    256 * 256 * 4
+                    128 * 128 * 4
                 } else {
                     webrender::WebRenderOptions::default().upload_pbo_default_size
                 },
                 picture_tile_size: low_memory_webrender
-                    .then_some(DeviceIntSize::new(512, 256)),
+                    .then_some(DeviceIntSize::new(256, 256)),
                 texture_cache_config: if low_memory_webrender {
                     low_memory_texture_cache_config()
                 } else {
                     webrender::TextureCacheConfig::DEFAULT
                 },
-                max_shared_surface_size: if low_memory_webrender { 1024 } else { 2048 },
+                max_shared_surface_size: if low_memory_webrender { 512 } else { 2048 },
                 workers,
                 size_of_op: Some(servo_allocator::usable_size),
                 // This ensures that we can use the `PainterId` as the `IdNamespace`, which allows mapping
@@ -338,6 +366,9 @@ impl Painter {
                 (*timer_refresh_driver).clone(),
             ),
             property_binding_key_counter: Default::default(),
+            next_memory_reclaim: low_memory_webrender
+                .then(|| Instant::now() + Duration::from_secs(15)),
+            memory_reclaim_interval,
         };
         painter.assert_gl_framebuffer_complete();
         painter.clear_background();
@@ -450,6 +481,8 @@ impl Painter {
 
     #[servo_tracing::instrument(skip_all)]
     pub(crate) fn render(&mut self, time_profiler_channel: &ProfilerChan) {
+        self.maybe_reclaim_memory();
+
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
 
@@ -485,6 +518,24 @@ impl Painter {
 
         self.screenshot_taker.maybe_take_screenshots(self);
         self.send_pending_paint_metrics_messages_after_composite();
+    }
+
+    fn maybe_reclaim_memory(&mut self) {
+        let Some(deadline) = self.next_memory_reclaim else {
+            return;
+        };
+        let now = Instant::now();
+        if now < deadline {
+            return;
+        }
+
+        // WebRender retains texture-cache atlases, render targets, upload
+        // buffers, and frame allocator chunks for desktop-browser reuse. Its
+        // native pressure path preserves the scene and external WebGL/media
+        // images while releasing caches that can be rebuilt on demand.
+        self.webrender_api.notify_memory_pressure();
+        self.next_memory_reclaim = Some(now + self.memory_reclaim_interval);
+        info!("Released rebuildable WebRender caches for low-memory overlay profile");
     }
 
     fn clear_background(&self) {
